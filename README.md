@@ -63,6 +63,55 @@ dsh --profile dsh-tui
 
 `dsh plugin --profile <web|desktop|dsh-tui> exec dsh-workbuddy-connect status`：登录状态与剩余积分（`--json` 输出机器可读格式；另有 `doctor` 诊断、`logout` 清理凭据）。
 
+## 通用 OpenAI BaseURL（已安装 DSH 插件的用户）
+
+已安装本插件且已登录 WorkBuddy 桌面 App 的 Windows 用户，可启动仅限本机的 OpenAI Chat Completions 兼容端点：
+
+```powershell
+$env:WORKBUDDY_PROXY_API_KEY = "sk-local-workbuddy"
+dsh-workbuddy-connect serve
+```
+
+默认会显示：
+
+```text
+WorkBuddy OpenAI proxy is running
+Base URL: http://127.0.0.1:7863/v1
+API Key: configured via WORKBUDDY_PROXY_API_KEY
+Bind: 127.0.0.1 only
+Press Ctrl+C to stop.
+```
+
+在支持 OpenAI Chat Completions 的客户端中填写：
+
+```text
+Base URL: http://127.0.0.1:7863/v1
+API Key:  sk-local-workbuddy
+```
+
+支持的接口与能力：
+
+| 接口或能力 | 说明 |
+| --- | --- |
+| `GET /v1/models` | 当前 WorkBuddy 模型目录 |
+| `POST /v1/chat/completions` | OpenAI Chat Completions 兼容请求 |
+| `GET /healthz` | 本机健康检查 |
+| `stream: true` | 原样 SSE 流式返回 |
+| `stream: false` 或省略 | 在本机聚合上游 SSE，返回一个 `chat.completion` JSON |
+| tools / `tool_choice` | 透传并沿用已有上游规范化 |
+| `reasoning_content`、工具参数片段 | 非流式响应中聚合 |
+| 图片消息 | 沿用已有按模型声明的多模态透传 |
+
+安全与边界：
+
+- 必须先登录 WorkBuddy 桌面 App；桌面端认证文件始终只读，刷新 token 仍仅写入插件自己的凭据副本。
+- 服务只绑定 `127.0.0.1`，没有 `--host`、LAN 或远程访问。
+- 推荐设置 `WORKBUDDY_PROXY_API_KEY` 以使用稳定本地密钥。`--api-key` 仅为便利功能，可能暴露在 shell 历史或进程检查中。
+- 未设置密钥时会生成每次启动不同的临时密钥，并只显示一次。
+- 不要把 WorkBuddy `accessToken` 或 `refreshToken` 粘贴到客户端；客户端只使用本地代理密钥。
+
+本版本不支持 `/v1/responses`、`/v1/messages`、embeddings、远程/LAN 服务、独立 WorkBuddy OAuth 登录或多账号轮换。
+
 ## 已知限制
 
 - 在 macOS 的 DSH Web / Desktop / TUI profile（`0.1.1-rc.2`+、Node 22+）下验证通过。Windows 会依次探测 Local 与 Roaming AppData；WSL 会优先从挂载的 Windows 用户目录读取登录凭据。若 Windows 与 Linux 用户名不同且 Windows 环境变量未传入 WSL，请通过 `WORKBUDDY_AUTH_FILE` 指定实际位置。
