@@ -20,7 +20,10 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { Readable } from 'node:stream'
 import type { WorkBuddyCredentialStore } from './auth.ts'
 import type { WorkBuddyCatalog } from './catalog.ts'
+import { aggregateChatCompletionSse } from './openai-sse.ts'
 import { prepareChatBody, WorkBuddyUpstreamClient, type UpstreamErrorKind } from './upstream.ts'
+
+export type ShimResponsePolicy = 'force-stream' | 'respect-client'
 
 /** Minimal logger surface the plugin context already provides. */
 export interface ShimLogger {
@@ -51,6 +54,12 @@ export interface WorkBuddyShimOptions {
   client: Pick<WorkBuddyUpstreamClient, 'chatStream'>
   catalog: WorkBuddyCatalog
   logger?: ShimLogger
+  /** Listener port; the DSH bridge remains ephemeral by default. */
+  port?: number
+  /** Optional local bearer; defaults to a per-process random secret. */
+  apiKey?: string
+  /** DSH retains force-stream unless standalone mode opts in. */
+  responsePolicy?: ShimResponsePolicy
 }
 
 const REQUEST_BODY_LIMIT = 64 * 1024 * 1024
@@ -139,6 +148,41 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   })
 }
 
+function readChatRequestMetadata(raw: string): { stream: boolean, model: string } {
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      return { stream: false, model: '' }
+    }
+    const body = parsed as Record<string, unknown>
+    return {
+      stream: body['stream'] === true,
+      model: typeof body['model'] === 'string' ? body['model'] : '',
+    }
+  } catch {
+    return { stream: false, model: '' }
+  }
+}
+
+function pipeStreamingResponse(response: Response, res: ServerResponse, logger: ShimLogger | undefined): void {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  })
+  let sawDone = false
+  const body = Readable.fromWeb(response.body as Parameters<typeof Readable.fromWeb>[0])
+  body.on('data', (chunk: Buffer) => {
+    if (chunk.includes('[DONE]')) sawDone = true
+  })
+  body.on('error', (error: unknown) => {
+    logger?.warn('dsh-workbuddy-connect: upstream stream failed mid-flight', error)
+    if (!sawDone && res.writable) res.end('data: [DONE]\n\n')
+  })
+  body.pipe(res)
+}
+
 /**
  * Start the loopback endpoint. Requests carry any bearer; the loopback bind
  * is the boundary, and the upstream credential comes from the store alone.
@@ -151,7 +195,9 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
   // as the OpenAI apiKey, which pi-ai sends as `Authorization: Bearer ...`.
   // The shim never forwards it upstream — the real credential comes from the
   // store. A local attacker who can hit the port still cannot forge this.
-  const SHARED_SECRET = randomBytes(32).toString('base64url')
+  const sharedSecret = options.apiKey ?? randomBytes(32).toString('base64url')
+  const listenPort = options.port ?? 0
+  const responsePolicy = options.responsePolicy ?? 'force-stream'
 
   /** Constant-time bearer check; absent or mismatched bearers are rejected. */
   function bearerOk(req: IncomingMessage): boolean {
@@ -160,7 +206,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
     const match = /^Bearer\s+(.+)$/i.exec(header.trim())
     if (match === null) return false
     const presented = match[1] as string
-    const expected = SHARED_SECRET
+    const expected = sharedSecret
     const a = Buffer.from(presented)
     const b = Buffer.from(expected)
     if (a.length !== b.length) return false
@@ -176,7 +222,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
     server.once('error', reject)
   })
 
-  server.listen(0, '127.0.0.1')
+  server.listen(listenPort, '127.0.0.1')
 
   const baseUrl = (): string => {
     const address = server.address()
@@ -249,6 +295,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
     }
 
     const raw = (await readBody(req)).toString('utf8')
+    const metadata = readChatRequestMetadata(raw)
     const prepared = prepareChatBody(raw)
 
     const controller = new AbortController()
@@ -265,28 +312,26 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
       return
     }
 
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
-      'X-Accel-Buffering': 'no',
-    })
-    let sawDone = false
-    const body = Readable.fromWeb(result.response.body as Parameters<typeof Readable.fromWeb>[0])
-    body.on('data', (chunk: Buffer) => {
-      if (chunk.includes('[DONE]')) sawDone = true
-    })
-    body.on('error', (error: unknown) => {
-      logger?.warn('dsh-workbuddy-connect: upstream stream failed mid-flight', error)
-      if (!sawDone && res.writable) res.end('data: [DONE]\n\n')
-    })
-    body.pipe(res)
+    if (responsePolicy === 'force-stream' || metadata.stream) {
+      pipeStreamingResponse(result.response, res, logger)
+      return
+    }
+    if (result.response.body === null) {
+      writeOpenAIError(res, 502, 'upstream_parse', 'workbuddy upstream returned no response body')
+      return
+    }
+    try {
+      const completion = await aggregateChatCompletionSse(result.response.body, metadata.model)
+      writeJson(res, 200, completion)
+    } catch (error: unknown) {
+      writeOpenAIError(res, 502, 'upstream_parse', String(error))
+    }
   }
 
   return {
     ready,
     baseUrl,
-    token: () => SHARED_SECRET,
+    token: () => sharedSecret,
     close: () => new Promise<void>((resolve, reject) => {
       server.close(() => resolve())
       server.closeAllConnections()
