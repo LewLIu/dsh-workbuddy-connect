@@ -19,8 +19,8 @@ if errorlevel 1 (
 )
 
 if not defined WORKBUDDY_PROXY_API_KEY (
-  echo [INFO] WORKBUDDY_PROXY_API_KEY is not set.
-  echo [INFO] The proxy will print a new ephemeral local key for this launch.
+  set "WORKBUDDY_PROXY_API_KEY=wb-local"
+  echo [INFO] WORKBUDDY_PROXY_API_KEY is not set; using local key: wb-local
 )
 
 node "%CLI%" serve
