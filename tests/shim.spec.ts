@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { WorkBuddyCredentialStore } from '../src/auth.ts'
 import { WorkBuddyCatalog } from '../src/catalog.ts'
-import { createWorkBuddyShim, type WorkBuddyShim } from '../src/shim.ts'
+import { createWorkBuddyShim, type WorkBuddyShim, type WorkBuddyShimOptions } from '../src/shim.ts'
 import type { WorkBuddyChatResult } from '../src/upstream.ts'
 
 const CLEANUP: (() => Promise<void>)[] = []
@@ -50,7 +50,10 @@ function rawRequest(options: {
   })
 }
 
-async function startShim(upstreamResponse: () => WorkBuddyChatResult): Promise<Harness> {
+async function startShim(
+  upstreamResponse: () => WorkBuddyChatResult,
+  shimOptions: Partial<Pick<WorkBuddyShimOptions, 'port' | 'apiKey' | 'responsePolicy'>> = {},
+): Promise<Harness> {
   const dir = await mkdtemp(join(tmpdir(), 'wb-shim-'))
   CLEANUP.push(() => rm(dir, { recursive: true, force: true }))
   const desktop = join(dir, 'workbuddy-desktop.info')
@@ -78,6 +81,7 @@ async function startShim(upstreamResponse: () => WorkBuddyChatResult): Promise<H
         return harness.upstreamResponse()
       },
     },
+    ...shimOptions,
   })
   await harness.shim.ready
   CLEANUP.push(() => harness.shim.close())
@@ -85,6 +89,27 @@ async function startShim(upstreamResponse: () => WorkBuddyChatResult): Promise<H
 }
 
 describe('WorkBuddy shim', () => {
+  it('uses an explicit standalone bearer when configured', async () => {
+    const harness = await startShim(
+      () => ({ ok: false, status: 500, kind: 'server', message: 'unused' }),
+      { apiKey: 'sk-explicit-test' },
+    )
+
+    expect(harness.shim.token()).toBe('sk-explicit-test')
+
+    const response = await fetch(`${harness.shim.baseUrl()}/healthz`, {
+      headers: { authorization: 'Bearer sk-explicit-test' },
+    })
+    expect(response.status).toBe(200)
+  })
+
+  it('keeps an ephemeral port by default', async () => {
+    const harness = await startShim(
+      () => ({ ok: false, status: 500, kind: 'server', message: 'unused' }),
+    )
+    expect(Number(new URL(harness.shim.baseUrl()).port)).toBeGreaterThan(0)
+  })
+
   it('lists the catalog on /v1/models', async () => {
     const harness = await startShim(() => ({ ok: false, status: 500, kind: 'server', message: 'unused' }))
     const response = await fetch(`${harness.shim.baseUrl()}/v1/models`, {
@@ -98,7 +123,7 @@ describe('WorkBuddy shim', () => {
     expect(ids.length).toBe(11)
   })
 
-  it('streams a successful chat completion and normalizes the body', async () => {
+  it('force-stream remains the default even when the request says stream false', async () => {
     const harness = await startShim(() => ({
       ok: true,
       response: new Response('data: {"choices":[{"delta":{"content":"你好"}}]}\n\ndata: [DONE]\n\n', {
@@ -125,6 +150,116 @@ describe('WorkBuddy shim', () => {
     const forwarded = JSON.parse(harness.upstreamBodies[0] ?? '') as Record<string, unknown>
     expect(forwarded['stream']).toBe(true)
     expect(forwarded['tool_choice']).toBe('auto')
+  })
+
+  it('respect-client returns JSON when stream is false', async () => {
+    const harness = await startShim(() => ({
+      ok: true,
+      response: new Response(
+        'data: {"id":"chatcmpl-1","created":123,"model":"auto","choices":[{"index":0,"delta":{"role":"assistant","content":"你"},"finish_reason":null}]}\n\n'
+        + 'data: {"choices":[{"index":0,"delta":{"content":"好"},"finish_reason":"stop"}],"usage":{"total_tokens":3}}\n\n'
+        + 'data: [DONE]\n\n',
+        { headers: { 'Content-Type': 'text/event-stream' } },
+      ),
+    }), { responsePolicy: 'respect-client' })
+    const response = await fetch(`${harness.shim.baseUrl()}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', authorization: `Bearer ${harness.shim.token()}` },
+      body: JSON.stringify({ model: 'auto', stream: false, messages: [{ role: 'user', content: 'hi' }] }),
+    })
+
+    expect(response.headers.get('content-type')).toContain('application/json')
+    expect(await response.json()).toMatchObject({
+      object: 'chat.completion',
+      model: 'auto',
+      choices: [{
+        message: { role: 'assistant', content: '你好' },
+        finish_reason: 'stop',
+      }],
+    })
+  })
+
+  it('respect-client treats omitted stream as false', async () => {
+    const harness = await startShim(() => ({
+      ok: true,
+      response: new Response(
+        'data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\n'
+        + 'data: [DONE]\n\n',
+        { headers: { 'Content-Type': 'text/event-stream' } },
+      ),
+    }), { responsePolicy: 'respect-client' })
+    const response = await fetch(`${harness.shim.baseUrl()}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', authorization: `Bearer ${harness.shim.token()}` },
+      body: JSON.stringify({ model: 'auto', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+
+    expect(response.headers.get('content-type')).toContain('application/json')
+    expect((await response.json() as { object: string }).object).toBe('chat.completion')
+  })
+
+  it('respect-client still streams when stream is true', async () => {
+    const harness = await startShim(() => ({
+      ok: true,
+      response: new Response('data: [DONE]\n\n', { headers: { 'Content-Type': 'text/event-stream' } }),
+    }), { responsePolicy: 'respect-client' })
+    const response = await fetch(`${harness.shim.baseUrl()}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', authorization: `Bearer ${harness.shim.token()}` },
+      body: JSON.stringify({ model: 'auto', stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+    })
+
+    expect(response.headers.get('content-type')).toContain('text/event-stream')
+    expect(await response.text()).toContain('[DONE]')
+  })
+
+  it('respect-client merges reasoning and tool-call fragments into JSON', async () => {
+    const harness = await startShim(() => ({
+      ok: true,
+      response: new Response(
+        'data: {"choices":[{"index":0,"delta":{"reasoning_content":"先想","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"weather","arguments":"{\\"city\\":"}}]},"finish_reason":null}]}\n\n'
+        + 'data: {"choices":[{"index":0,"delta":{"reasoning_content":"一下","tool_calls":[{"index":0,"function":{"arguments":"\\"Melbourne\\"}"}}]},"finish_reason":"tool_calls"}]}\n\n'
+        + 'data: [DONE]\n\n',
+        { headers: { 'Content-Type': 'text/event-stream' } },
+      ),
+    }), { responsePolicy: 'respect-client' })
+    const response = await fetch(`${harness.shim.baseUrl()}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', authorization: `Bearer ${harness.shim.token()}` },
+      body: JSON.stringify({ model: 'auto', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+
+    expect(await response.json()).toMatchObject({
+      choices: [{
+        message: {
+          reasoning_content: '先想一下',
+          tool_calls: [{
+            index: 0,
+            id: 'call_1',
+            type: 'function',
+            function: { name: 'weather', arguments: '{"city":"Melbourne"}' },
+          }],
+        },
+        finish_reason: 'tool_calls',
+      }],
+    })
+  })
+
+  it('maps invalid upstream SSE to an OpenAI 502 error in respect-client mode', async () => {
+    const harness = await startShim(() => ({
+      ok: true,
+      response: new Response('data: not-json\n\ndata: [DONE]\n\n', {
+        headers: { 'Content-Type': 'text/event-stream' },
+      }),
+    }), { responsePolicy: 'respect-client' })
+    const response = await fetch(`${harness.shim.baseUrl()}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', authorization: `Bearer ${harness.shim.token()}` },
+      body: JSON.stringify({ model: 'auto', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+
+    expect(response.status).toBe(502)
+    expect(await response.json()).toMatchObject({ error: { type: 'upstream_parse' } })
   })
 
   it('maps an upstream credit failure onto HTTP 402', async () => {

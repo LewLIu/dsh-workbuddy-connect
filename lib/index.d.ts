@@ -206,6 +206,7 @@ declare class WorkBuddyCatalog {
 }
 //#endregion
 //#region src/shim.d.ts
+type ShimResponsePolicy = 'force-stream' | 'respect-client';
 /** Minimal logger surface the plugin context already provides. */
 interface ShimLogger {
   warn(...args: unknown[]): void;
@@ -233,6 +234,12 @@ interface WorkBuddyShimOptions {
   client: Pick<WorkBuddyUpstreamClient, 'chatStream'>;
   catalog: WorkBuddyCatalog;
   logger?: ShimLogger;
+  /** Listener port; the DSH bridge remains ephemeral by default. */
+  port?: number;
+  /** Optional local bearer; defaults to a per-process random secret. */
+  apiKey?: string;
+  /** DSH retains force-stream unless standalone mode opts in. */
+  responsePolicy?: ShimResponsePolicy;
 }
 /**
  * Start the loopback endpoint. Requests carry any bearer; the loopback bind
@@ -265,6 +272,28 @@ interface WorkBuddyAdapter {
  * ephemeral port applies from the first snapshot after startup.
  */
 declare function createWorkBuddyAdapter(options: WorkBuddyAdapterOptions): WorkBuddyAdapter;
+//#endregion
+//#region src/standalone.d.ts
+interface StandaloneWorkBuddyOptions {
+  /** Defaults to the CLI's stable local port; tests may pass 0. */
+  port?: number;
+  /** Callers provide a local proxy key; it is never forwarded upstream. */
+  apiKey: string;
+  logger?: ShimLogger;
+  /** Offline test seam; production callers use the existing implementations. */
+  dependencies?: {
+    client?: WorkBuddyUpstreamClient;
+    store?: WorkBuddyCredentialStore;
+    catalog?: WorkBuddyCatalog;
+  };
+}
+interface StandaloneWorkBuddyServer {
+  baseUrl: string;
+  apiKey: string;
+  close(): Promise<void>;
+}
+/** Start the standalone, loopback-only OpenAI Chat Completions endpoint. */
+declare function startStandaloneWorkBuddyServer(options: StandaloneWorkBuddyOptions): Promise<StandaloneWorkBuddyServer>;
 //#endregion
 //#region src/host-heartbeat.d.ts
 /**
@@ -352,4 +381,4 @@ declare const Config: z<Config>;
  */
 declare function apply(ctx: Context, config: Config): void;
 //#endregion
-export { Config, FALLBACK_WORKBUDDY_MODELS, type UpstreamErrorKind, WORKBUDDY_AUTH_FILENAME, WORKBUDDY_AUTH_FILE_ENV, WORKBUDDY_HOST_HEARTBEAT_FILENAME, WORKBUDDY_PROVIDER, WORKBUDDY_SETTINGS_NS, WORKBUDDY_STREAM_IDLE_TIMEOUT_MS, type WorkBuddyAdapter, type WorkBuddyAuthStatus, WorkBuddyCatalog, type WorkBuddyChatResult, type WorkBuddyCredential, WorkBuddyCredentialStore, type WorkBuddyCredits, type WorkBuddyHostHeartbeat, type WorkBuddyModelInfo, type WorkBuddyRefreshOutcome, type WorkBuddyShim, WorkBuddyUpstreamClient, type WorkBuddyUpstreamModel, apply, classifyUpstreamError, clearHostHeartbeat, createWorkBuddyAdapter, createWorkBuddyShim, defaultDesktopAuthCandidates, defaultDesktopAuthPath, inject, isHeartbeatProcessAlive, name, parseWorkBuddyAuth, prepareChatBody, processStartTimeMs, readHostHeartbeat, regionOf, workbuddyHostHeartbeatPath, workbuddyOwnAuthPath };
+export { Config, FALLBACK_WORKBUDDY_MODELS, type StandaloneWorkBuddyOptions, type StandaloneWorkBuddyServer, type UpstreamErrorKind, WORKBUDDY_AUTH_FILENAME, WORKBUDDY_AUTH_FILE_ENV, WORKBUDDY_HOST_HEARTBEAT_FILENAME, WORKBUDDY_PROVIDER, WORKBUDDY_SETTINGS_NS, WORKBUDDY_STREAM_IDLE_TIMEOUT_MS, type WorkBuddyAdapter, type WorkBuddyAuthStatus, WorkBuddyCatalog, type WorkBuddyChatResult, type WorkBuddyCredential, WorkBuddyCredentialStore, type WorkBuddyCredits, type WorkBuddyHostHeartbeat, type WorkBuddyModelInfo, type WorkBuddyRefreshOutcome, type WorkBuddyShim, WorkBuddyUpstreamClient, type WorkBuddyUpstreamModel, apply, classifyUpstreamError, clearHostHeartbeat, createWorkBuddyAdapter, createWorkBuddyShim, defaultDesktopAuthCandidates, defaultDesktopAuthPath, inject, isHeartbeatProcessAlive, name, parseWorkBuddyAuth, prepareChatBody, processStartTimeMs, readHostHeartbeat, regionOf, startStandaloneWorkBuddyServer, workbuddyHostHeartbeatPath, workbuddyOwnAuthPath };

@@ -20,6 +20,11 @@ import { clearHostHeartbeat, writeHostHeartbeat } from './host-heartbeat.ts'
 export { WORKBUDDY_PROVIDER, WORKBUDDY_STREAM_IDLE_TIMEOUT_MS, createWorkBuddyAdapter, type WorkBuddyAdapter } from './adapter.ts'
 export { createWorkBuddyShim, type WorkBuddyShim } from './shim.ts'
 export {
+  startStandaloneWorkBuddyServer,
+  type StandaloneWorkBuddyOptions,
+  type StandaloneWorkBuddyServer,
+} from './standalone.ts'
+export {
   FALLBACK_WORKBUDDY_MODELS,
   WorkBuddyCatalog,
   type WorkBuddyModelInfo,
