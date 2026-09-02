@@ -2,16 +2,70 @@
 /** Standalone status/diagnostics CLI for the dsh-workbuddy-connect bundle. */
 
 import { realpathSync } from 'node:fs'
+import { randomBytes } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { WorkBuddyCredentialStore, workbuddyOwnAuthPath } from './auth.ts'
 import { WorkBuddyUpstreamClient } from './upstream.ts'
 import { FALLBACK_WORKBUDDY_MODELS } from './catalog.ts'
+import { startStandaloneWorkBuddyServer } from './standalone.ts'
 import { WORKBUDDY_CONNECT_VERSION } from './version.ts'
 import { isHeartbeatProcessAlive, readHostHeartbeat, workbuddyHostHeartbeatPath } from './host-heartbeat.ts'
 
-type Action = 'doctor' | 'logout' | 'status'
+type Action = 'doctor' | 'logout' | 'serve' | 'status'
 
 const JSON_SCHEMA_VERSION = 1
+
+export const WORKBUDDY_PROXY_API_KEY_ENV = 'WORKBUDDY_PROXY_API_KEY'
+
+export interface ServeCliOptions {
+  port: number
+  apiKey?: string
+}
+
+export interface ResolvedProxyKey {
+  value: string
+  source: 'flag' | 'env' | 'generated'
+}
+
+function parsePort(value: string): number {
+  if (!/^\d+$/u.test(value)) throw new Error(`invalid --port: ${JSON.stringify(value)}`)
+  const port = Number(value)
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`invalid --port: ${JSON.stringify(value)}; expected 1-65535`)
+  }
+  return port
+}
+
+export function parseServeCliOptions(flags: readonly string[]): ServeCliOptions {
+  let port = 7863
+  let apiKey: string | undefined
+  for (let index = 0; index < flags.length; index += 1) {
+    const flag = flags[index]
+    if (flag === '--port') {
+      const value = flags[index + 1]
+      if (value === undefined) throw new Error('missing value for --port')
+      port = parsePort(value)
+      index += 1
+      continue
+    }
+    if (flag === '--api-key') {
+      const value = flags[index + 1]
+      if (value === undefined || value.trim() === '') throw new Error('missing value for --api-key')
+      apiKey = value
+      index += 1
+      continue
+    }
+    throw new Error(`unknown serve option: ${JSON.stringify(flag)}`)
+  }
+  return apiKey === undefined ? { port } : { port, apiKey }
+}
+
+export function resolveProxyApiKey(explicit: string | undefined, env: NodeJS.ProcessEnv): ResolvedProxyKey {
+  if (explicit !== undefined) return { value: explicit, source: 'flag' }
+  const fromEnv = env[WORKBUDDY_PROXY_API_KEY_ENV]?.trim()
+  if (fromEnv !== undefined && fromEnv !== '') return { value: fromEnv, source: 'env' }
+  return { value: randomBytes(32).toString('base64url'), source: 'generated' }
+}
 
 /** Remove token-like strings from an unexpected diagnostic message. */
 function safeMessage(error: unknown): string {
@@ -23,12 +77,21 @@ function safeMessage(error: unknown): string {
 
 function printHelp(): void {
   process.stdout.write([
-    'Usage: dsh-workbuddy-connect <doctor|status|logout> [--json]',
+    'Usage: dsh-workbuddy-connect <doctor|status|logout|serve> [options]',
     '',
     '  doctor   secret-free sign-in and environment diagnostics',
     '  status   sign-in state, remaining WorkBuddy credit, and host-bundle health',
     '  logout   remove the plugin-owned credential copy (the desktop app keeps its sign-in)',
     '  --json   emit one secret-free JSON document (doctor/status only)',
+    '',
+    'serve options:',
+    '  --port <1-65535>  loopback port (default: 7863)',
+    '  --api-key <key>   bearer for local OpenAI clients',
+    `                    preferred persistent source: ${WORKBUDDY_PROXY_API_KEY_ENV}`,
+    '',
+    'PowerShell:',
+    `  $env:${WORKBUDDY_PROXY_API_KEY_ENV} = "sk-local-workbuddy"`,
+    '  dsh-workbuddy-connect serve',
     '',
   ].join('\n'))
 }
@@ -140,6 +203,44 @@ async function status(jsonOutput: boolean): Promise<number> {
   return 0
 }
 
+function waitForShutdownSignal(): Promise<void> {
+  return new Promise(resolve => {
+    const done = (): void => {
+      process.off('SIGINT', done)
+      process.off('SIGTERM', done)
+      resolve()
+    }
+    process.once('SIGINT', done)
+    process.once('SIGTERM', done)
+  })
+}
+
+async function serve(flags: readonly string[]): Promise<number> {
+  const parsed = parseServeCliOptions(flags)
+  const key = resolveProxyApiKey(parsed.apiKey, process.env)
+  const server = await startStandaloneWorkBuddyServer({
+    port: parsed.port,
+    apiKey: key.value,
+    logger: {
+      warn: (...args) => console.warn(...args.map(safeMessage)),
+      error: (...args) => console.error(...args.map(safeMessage)),
+    },
+  })
+  process.stdout.write([
+    'WorkBuddy OpenAI proxy is running',
+    `Base URL: ${server.baseUrl}`,
+    key.source === 'generated'
+      ? `API Key: ${key.value}`
+      : `API Key: configured via ${key.source === 'env' ? WORKBUDDY_PROXY_API_KEY_ENV : '--api-key'}`,
+    'Bind: 127.0.0.1 only',
+    'Press Ctrl+C to stop.',
+    '',
+  ].join('\n'))
+  await waitForShutdownSignal()
+  await server.close()
+  return 0
+}
+
 /** Execute one boot-free command. */
 export async function run(argv: readonly string[]): Promise<number> {
   if (argv.length === 0 || argv[0] === '--help' || argv[0] === '-h') {
@@ -147,15 +248,19 @@ export async function run(argv: readonly string[]): Promise<number> {
     return 0
   }
   const [rawAction, ...flags] = argv
-  const actions: readonly Action[] = ['doctor', 'logout', 'status']
+  const actions: readonly Action[] = ['doctor', 'logout', 'serve', 'status']
   if (!actions.includes(rawAction as Action)) {
-    process.stderr.write(`dsh-workbuddy-connect: expected doctor, logout, or status; got ${JSON.stringify(rawAction)}\n`)
+    process.stderr.write(`dsh-workbuddy-connect: expected doctor, logout, serve, or status; got ${JSON.stringify(rawAction)}\n`)
     return 1
   }
   const action = rawAction as Action
+  if (action === 'serve' && flags.includes('--json')) {
+    process.stderr.write(`dsh-workbuddy-connect: invalid options for serve: ${flags.join(' ')}\n`)
+    return 1
+  }
   const jsonOutput = flags.includes('--json')
   const unknown = flags.filter(flag => flag !== '--json')
-  if (unknown.length > 0 || (jsonOutput && action === 'logout')) {
+  if (action !== 'serve' && (unknown.length > 0 || (jsonOutput && action === 'logout'))) {
     process.stderr.write(`dsh-workbuddy-connect: invalid options for ${action}: ${flags.join(' ')}\n`)
     return 1
   }
@@ -165,6 +270,8 @@ export async function run(argv: readonly string[]): Promise<number> {
         return await doctor(jsonOutput)
       case 'status':
         return await status(jsonOutput)
+      case 'serve':
+        return await serve(flags)
       case 'logout': {
         const store = makeStore()
         await store.logout()

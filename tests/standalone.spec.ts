@@ -1,3 +1,4 @@
+import { createServer } from 'node:http'
 import { describe, expect, it } from 'vitest'
 import { WorkBuddyCredentialStore } from '../src/auth.ts'
 import { WorkBuddyCatalog } from '../src/catalog.ts'
@@ -113,6 +114,47 @@ describe('startStandaloneWorkBuddyServer', () => {
       expect(body.data.map(model => model.id)).toContain('auto')
     } finally {
       await server.close()
+    }
+  })
+
+  it('fails clearly when the requested loopback port is occupied', async () => {
+    const listener = createServer()
+    await new Promise<void>((resolve, reject) => {
+      listener.once('error', reject)
+      listener.listen(0, '127.0.0.1', resolve)
+    })
+    const address = listener.address()
+    if (address === null || typeof address === 'string') throw new Error('test listener has no port')
+
+    const credential = {
+      accessToken: 'at',
+      refreshToken: 'rt',
+      expiresAtMs: Date.now() + 60_000,
+      domain: 'www.codebuddy.cn',
+      uid: 'u1',
+      source: 'desktop',
+    } as const
+    const store = {
+      async resolve() { return credential },
+    } as unknown as WorkBuddyCredentialStore
+    const client = {
+      async fetchModels() { return [] },
+      async chatStream() {
+        return { ok: true, response: new Response('data: [DONE]\n\n') } as const
+      },
+    } as unknown as WorkBuddyUpstreamClient
+
+    try {
+      await expect(startStandaloneWorkBuddyServer({
+        port: address.port,
+        apiKey: 'sk-test',
+        dependencies: { store, client, catalog: new WorkBuddyCatalog() },
+      })).rejects.toMatchObject({ code: 'EADDRINUSE' })
+    } finally {
+      await new Promise<void>((resolve, reject) => listener.close(error => {
+        if (error === undefined) resolve()
+        else reject(error)
+      }))
     }
   })
 })
