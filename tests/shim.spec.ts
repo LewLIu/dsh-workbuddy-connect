@@ -245,6 +245,23 @@ describe('WorkBuddy shim', () => {
     })
   })
 
+  it('maps invalid upstream SSE to an OpenAI 502 error in respect-client mode', async () => {
+    const harness = await startShim(() => ({
+      ok: true,
+      response: new Response('data: not-json\n\ndata: [DONE]\n\n', {
+        headers: { 'Content-Type': 'text/event-stream' },
+      }),
+    }), { responsePolicy: 'respect-client' })
+    const response = await fetch(`${harness.shim.baseUrl()}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', authorization: `Bearer ${harness.shim.token()}` },
+      body: JSON.stringify({ model: 'auto', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+
+    expect(response.status).toBe(502)
+    expect(await response.json()).toMatchObject({ error: { type: 'upstream_parse' } })
+  })
+
   it('maps an upstream credit failure onto HTTP 402', async () => {
     const harness = await startShim(() => ({
       ok: false,
